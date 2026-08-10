@@ -977,7 +977,8 @@ function parseBesoinSheet(rows, queueLabel, besoinMap, queueSet){
       const key = iso+'|'+slotLabel;
       if(!besoinMap[key]) besoinMap[key] = {besoin:0, queues:{}};
       besoinMap[key].besoin += besoin;
-      besoinMap[key].queues[queueLabel] = (besoinMap[key].queues[queueLabel]||0) + besoin;
+      const qKey = norm(queueLabel);
+      besoinMap[key].queues[qKey] = (besoinMap[key].queues[qKey]||0) + besoin;
     }
     count++;
   }
@@ -1007,7 +1008,9 @@ function processWorkbook(wb){
   }
   const queueSet = new Set();
   besoinNames.forEach(n=>{
-    const label = n.replace(/besoin\s*(en)?\s*etp/i,'').trim() || n;
+    // "Besoin en ETP TEL BAQ", "Besoins en ETP TEL BAQ", "ETP Besoin CHAT BAQ"... -> "TEL BAQ" / "CHAT BAQ"
+    const label = n.replace(/besoins?\s*(en)?\s*etp\W*/i,'').replace(/etp\W*/i,'').trim() || n;
+    queueSet.add(label);
     parseBesoinSheet(sheetToRows(wb,n), label, STATE.besoinMap, queueSet);
   });
   STATE.besoinQueues = Array.from(queueSet);
@@ -1039,6 +1042,11 @@ function computeCoverage(){
 function computeCoverageForDate(date, employees){
   const [y,mo,da] = date.split('-').map(Number);
   const dayMid = new Date(y,mo-1,da).getTime();
+  // Le besoin ETP est propre à chaque file/équipe (une feuille "Besoin ETP <Équipe>" par file).
+  // On ne doit additionner que le besoin des équipes réellement présentes dans le sous-ensemble
+  // affiché (respecte les filtres équipe/service/collaborateur), jamais le besoin global de toutes
+  // les files confondues.
+  const teams = new Set(employees.map(e=>norm(e.equipe)));
   const rows = [];
   for(let s=0;s<48;s++){
     const slotStart = dayMid + s*30*60000;
@@ -1058,8 +1066,13 @@ function computeCoverageForDate(date, employees){
     const slotLabel = STATE.slots[s];
     const key = date+'|'+slotLabel;
     const bEntry = STATE.besoinMap[key];
-    const besoin = bEntry ? round1(bEntry.besoin) : 0;
-    const hasBesoin = !!bEntry;
+    let besoin = 0, hasBesoin = false;
+    if(bEntry){
+      teams.forEach(t=>{
+        if(bEntry.queues[t]!=null){ besoin += bEntry.queues[t]; hasBesoin = true; }
+      });
+      besoin = round1(besoin);
+    }
     const ecart = round1(planifie - besoin);
     const couverture = hasBesoin && besoin>0 ? round0((planifie/besoin)*100) : (hasBesoin? (planifie>0?999:100) : null);
     rows.push({slot:slotLabel, besoin, planifie, reel, ecart, couverture, hasBesoin});
@@ -1777,18 +1790,73 @@ function gsParseBesoinTabs(raw){ return String(raw||'').split(',').map(s=>s.trim
 
 // Récupère un onglet du Google Sheet au format CSV (endpoint gviz : accessible en
 // lecture cross-origin pour les documents partagés "Toute personne disposant du lien").
-async function gsFetchSheetAsWorksheet(spreadsheetId, tabName){
-  const url = 'https://docs.google.com/spreadsheets/d/'+spreadsheetId+'/gviz/tq?tqx=out:csv&sheet='+encodeURIComponent(tabName)+'&_ts='+Date.now();
-  let res;
-  try{ res = await fetch(url, { method:'GET', cache:'no-store' }); }
-  catch(e){ throw new Error('Connexion réseau impossible vers Google Sheets (hors-ligne ou blocage CORS).'); }
-  if(!res.ok) throw new Error('Onglet "'+tabName+'" introuvable ou document non partagé (HTTP '+res.status+').');
-  const text = await res.text();
-  if(/^\s*<(!doctype|html)/i.test(text)){
-    throw new Error('Document non accessible publiquement — partagez-le en « Toute personne disposant du lien — Lecteur ».');
+// Chargement JSONP via balise <script> : contourne structurellement les restrictions CORS
+// (contrairement à fetch()/XHR, une balise <script src="..."> n'est jamais soumise à la
+// same-origin policy). C'est la méthode utilisée par la bibliothèque officielle
+// google.visualization.Query. Beaucoup plus fiable que fetch() vers l'endpoint CSV, qui ne
+// renvoie pas toujours d'en-tête Access-Control-Allow-Origin.
+function gvizQueryJSONP(spreadsheetId, tabName){
+  return new Promise((resolve, reject)=>{
+    const cbName = 'gvizCB_'+Math.random().toString(36).slice(2)+Date.now();
+    let settled = false;
+    const timer = setTimeout(()=>{
+      if(settled) return; settled = true;
+      cleanup();
+      reject(new Error('Délai dépassé (10s) en contactant Google Sheets. Vérifiez votre connexion.'));
+    }, 10000);
+    function cleanup(){
+      clearTimeout(timer);
+      try{ delete window[cbName]; }catch(e){ window[cbName] = undefined; }
+      if(script.parentNode) script.parentNode.removeChild(script);
+    }
+    window[cbName] = function(response){
+      if(settled) return; settled = true;
+      cleanup();
+      if(!response || response.status === 'error'){
+        const err = response && response.errors && response.errors[0];
+        const detail = err && (err.detailed_message || err.message);
+        reject(new Error('Onglet "'+tabName+'" : '+(detail || "introuvable, ou document non partagé publiquement.")));
+        return;
+      }
+      resolve(response.table);
+    };
+    const url = 'https://docs.google.com/spreadsheets/d/'+spreadsheetId+'/gviz/tq'
+      + '?tqx=out:json;responseHandler='+cbName
+      + '&headers=0&sheet='+encodeURIComponent(tabName)+'&_ts='+Date.now();
+    const script = document.createElement('script');
+    script.src = url;
+    script.onerror = function(){
+      if(settled) return; settled = true;
+      cleanup();
+      reject(new Error('Impossible de joindre Google Sheets pour l\'onglet "'+tabName+'" (document non partagé, onglet introuvable, ou hors-ligne).'));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+function gvizTableToAOA(table){
+  const rows = [];
+  // Filet de sécurité : si l'API a malgré tout extrait une ligne d'en-tête dans table.cols
+  // (labels non vides), on la réinjecte en première ligne pour ne perdre aucune donnée.
+  if(table.cols && table.cols.some(c=>c && c.label)){
+    rows.push(table.cols.map(c=>(c&&c.label) || null));
   }
-  const tmpWb = XLSX.read(text, { type:'string' });
-  return tmpWb.Sheets[tmpWb.SheetNames[0]];
+  (table.rows||[]).forEach(r=>{
+    rows.push((r.c||[]).map(cell=>{
+      if(cell==null) return null;
+      if(cell.f!=null && cell.f!=='') return cell.f;
+      if(cell.v!=null) return cell.v;
+      return null;
+    }));
+  });
+  return rows;
+}
+
+async function gsFetchSheetAsWorksheet(spreadsheetId, tabName){
+  const table = await gvizQueryJSONP(spreadsheetId, tabName);
+  const rows = gvizTableToAOA(table);
+  if(rows.length===0) throw new Error('Onglet "'+tabName+'" vide ou introuvable.');
+  return XLSX.utils.aoa_to_sheet(rows);
 }
 
 async function gsFetchWorkbook(sheetUrl, besoinTabNames){
