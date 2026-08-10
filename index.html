@@ -1821,7 +1821,7 @@ function gvizQueryJSONP(spreadsheetId, tabName){
       resolve(response.table);
     };
     const url = 'https://docs.google.com/spreadsheets/d/'+spreadsheetId+'/gviz/tq'
-      + '?tqx=out:json;responseHandler='+cbName
+      + '?tqx=out:json;responseHandler:'+cbName
       + '&headers=0&sheet='+encodeURIComponent(tabName)+'&_ts='+Date.now();
     const script = document.createElement('script');
     script.src = url;
