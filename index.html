@@ -2031,7 +2031,38 @@ document.getElementById('btnReimport').addEventListener('click', ()=>{
 /* ------------------------------------------------------------
    15. CHARGEMENT AUTOMATIQUE AU DEMARRAGE
    ------------------------------------------------------------ */
-(function initGoogleSheetsAutoLoad(){
+async function autoLoadExcel() {
+
+    try {
+
+        const response = await fetch("./planning.xlsx");
+
+        if (!response.ok) {
+            throw new Error("planning.xlsx introuvable");
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+
+        const wb = XLSX.read(arrayBuffer, {
+            type: "array",
+            cellDates: true
+        });
+
+        const ok = processWorkbook(wb);
+
+        if (ok) {
+            STATE.loaded = true;
+            openDashboard();
+        }
+
+    } catch (e) {
+        console.error(e);
+    }
+
+}
+   window.addEventListener("load", () => {
+    autoLoadExcel();
+});
   const cfg = gsLoadConfig();
   if(!cfg || !cfg.url) return;
   document.getElementById('gsUrl').value = cfg.url;
